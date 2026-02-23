@@ -173,6 +173,7 @@ namespace TWAINCLI
             // 3. 配置颜色模式 (bw/gray/color) [[19]]
             if (source.Capabilities.ICapPixelType.IsSupported && !string.IsNullOrEmpty(config.ColorMode))
             {
+                Console.WriteLine("启用颜色模式");
                 PixelType? pixelType = null;
                 string mode = config.ColorMode.ToLower();
                 if (mode == "bw" || mode == "blackandwhite" || mode == "1bit")
@@ -198,6 +199,7 @@ namespace TWAINCLI
             // 4. 配置分辨率 [[13]][[14]]
             if (config.Resolution > 0)
             {
+                Console.WriteLine("启用分辨率");
                 if (source.Capabilities.ICapXResolution.IsSupported && source.Capabilities.ICapXResolution.CanSet)
                     source.Capabilities.ICapXResolution.SetValue(config.Resolution);
                 if (source.Capabilities.ICapYResolution.IsSupported && source.Capabilities.ICapYResolution.CanSet)
@@ -208,6 +210,7 @@ namespace TWAINCLI
 
             if (config.Duplex && source.Capabilities.CapDuplexEnabled.IsSupported && source.Capabilities.CapDuplexEnabled.CanSet)
             {
+                Console.WriteLine("启用双面扫描");
                 source.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
             }
 
@@ -215,9 +218,7 @@ namespace TWAINCLI
             // TWAIN 的 Frame 坐标单位由 ICAP_UNITS 决定，默认为 Inches
             if (config.HasArea && source.Capabilities.ICapFrames.IsSupported && source.Capabilities.ICapFrames.CanSet)
             {
-                if (source.Capabilities.ICapUnits.IsSupported && source.Capabilities.ICapUnits.CanSet) {
-                    source.Capabilities.ICapUnits.SetValue(Unit.Millimeters);
-                }
+                Console.WriteLine("设置区域");
                 var frame = new TWFrame
                 {
                     Left = config.PageLeft,
@@ -360,7 +361,7 @@ namespace TWAINCLI
                         break;
                 }
             }
-
+            
             // 判断是否设置了扫描区域
             config.HasArea = config.PageWidth > 0 && config.PageHeight > 0;
             if (config.ScannerName == "") {
