@@ -23,10 +23,11 @@ namespace TWAINCLI
             Application.SetCompatibleTextRenderingDefault(false);
             NTwain.PlatformInfo.Current.PreferNewDSM = false;
 
-            // 解析命令行参数
+            // Parse command line arguments
             var config = ParseArguments(args);
             _outputPath = config.OutputPath;
-            // 如果只列出扫描仪，执行后退出
+
+            // If only listing scanners, execute and exit
             if (config.ListOnly)
             {
                 ListScanners();
@@ -35,110 +36,110 @@ namespace TWAINCLI
 
             try
             {
-                // 创建应用程序标识 [[31]]
+                // Create application identity [[31]]
                 var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
 
-                // 创建 TWAIN 会话
+                // Create TWAIN session
                 _session = new TwainSession(appId);
 
-                // 注册事件处理 [[31]]
+                // Register event handlers [[31]]
                 _session.TransferReady += TwainSession_TransferReady;
                 _session.DataTransferred += TwainSession_DataTransferred;
                 _session.SourceDisabled += TwainSession_SourceDisabled;
 
-                // 打开会话
+                // Open session
                 var openResult = _session.Open();
                 if (openResult != ReturnCode.Success)
                 {
-                    Console.WriteLine($"打开 TWAIN 会话失败: {openResult}");
+                    Console.WriteLine($"Failed to open TWAIN session: {openResult}");
                     return;
                 }
 
-                Console.WriteLine("TWAIN 会话已打开");
+                Console.WriteLine("TWAIN session opened");
 
-                // 查找并选择扫描仪
+                // Find and select scanner
                 DataSource selectedSource = null;
                 var sources = _session.GetSources().ToList();
 
                 if (sources.Count == 0)
                 {
-                    Console.WriteLine("未找到任何扫描仪");
+                    Console.WriteLine("No scanners found");
                     _session.Close();
                     return;
                 }
 
-                // 按名称选择扫描仪（如果指定了 -d 参数）
+                // Select scanner by name (if -d parameter specified)
                 if (!string.IsNullOrEmpty(config.ScannerName))
                 {
                     selectedSource = sources.FirstOrDefault(s =>
                         s.Name.IndexOf(config.ScannerName, StringComparison.OrdinalIgnoreCase) >= 0);
                     if (selectedSource == null)
                     {
-                        Console.WriteLine($"未找到名称包含 '{config.ScannerName}' 的扫描仪");
+                        Console.WriteLine($"No scanner found with name containing '{config.ScannerName}'");
                         _session.Close();
                         return;
                     }
                 }
                 else
                 {
-                    // 默认选择第一个可用扫描仪
+                    // Default to first available scanner
                     selectedSource = sources.FirstOrDefault();
                 }
 
                 if (selectedSource != null)
                 {
-                    Console.WriteLine($"\n选择扫描仪: {selectedSource.Name}");
+                    Console.WriteLine($"\nSelected scanner: {selectedSource.Name}");
 
-                    // 打开数据源 [[21]]
+                    // Open data source [[21]]
                     var openDsResult = selectedSource.Open();
                     if (openDsResult == ReturnCode.Success)
                     {
                         if (config.ShowUI)
                         {
-                            Console.WriteLine("扫描仪已打开，显示原生界面...");
-                            // 启用数据源进行扫描（无 UI 模式）[[21]]
+                            Console.WriteLine("Scanner opened, showing native UI...");
+                            // Enable data source for scanning (with UI mode) [[21]]
                             var enableResult = selectedSource.Enable(SourceEnableMode.ShowUI, false, IntPtr.Zero);
                             if (enableResult != ReturnCode.Success)
                             {
-                                Console.WriteLine($"启用扫描仪失败: {enableResult}");
+                                Console.WriteLine($"Failed to enable scanner: {enableResult}");
                                 selectedSource.Close();
                                 return;
                             }
                         }
-                        else {
-                            Console.WriteLine("扫描仪已打开，正在配置参数...");
+                        else
+                        {
+                            Console.WriteLine("Scanner opened, configuring parameters...");
 
-                            // 应用配置参数
+                            // Apply configuration parameters
                             ConfigureSource(selectedSource, config);
 
-                            // 启用数据源进行扫描（无 UI 模式）[[21]]
+                            // Enable data source for scanning (no UI mode) [[21]]
                             var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
                             if (enableResult != ReturnCode.Success)
                             {
-                                Console.WriteLine($"启用扫描仪失败: {enableResult}");
+                                Console.WriteLine($"Failed to enable scanner: {enableResult}");
                                 selectedSource.Close();
                                 return;
                             }
                         }
-                        
 
-                        // 运行消息循环，等待扫描完成
+                        // Run message loop, wait for scan completion
                         Application.Run();
                     }
                     else
                     {
-                        Console.WriteLine($"打开扫描仪失败: {openDsResult}");
+                        Console.WriteLine($"Failed to open scanner: {openDsResult}");
                         selectedSource.Close();
                     }
                 }
                 else
                 {
-                    Console.WriteLine("未找到合适的扫描仪");
+                    Console.WriteLine("No suitable scanner found");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"发生错误: {ex.Message}");
+                Console.WriteLine($"Error occurred: {ex.Message}");
                 Console.WriteLine(ex.StackTrace);
             }
             finally
@@ -146,24 +147,24 @@ namespace TWAINCLI
                 if (_session != null)
                 {
                     _session.Close();
-                    Console.WriteLine("TWAIN 会话已关闭");
+                    Console.WriteLine("TWAIN session closed");
                 }
             }
         }
 
         /// <summary>
-        /// 配置扫描仪的 TWAIN Capabilities [[12]][[13]]
+        /// Configure scanner TWAIN Capabilities [[12]][[13]]
         /// </summary>
         private static void ConfigureSource(DataSource source, ScanConfig config)
         {
-            // 1. 配置进纸器/平板 (feeder/flatbed)
+            // 1. Configure feeder/flatbed
             if (source.Capabilities.CapFeederEnabled.IsSupported)
             {
                 bool useFeeder = config.SourceType?.ToLower() == "feeder";
                 source.Capabilities.CapFeederEnabled.SetValue(useFeeder ? BoolType.True : BoolType.False);
             }
 
-            // 2. 配置光路类型 (positive/negative/flatbed) [[19]]
+            // 2. Configure light path (positive/negative/flatbed) [[19]]
             if (source.Capabilities.ICapLightPath.IsSupported && !string.IsNullOrEmpty(config.SourceType))
             {
                 switch (config.SourceType.ToLower())
@@ -185,10 +186,10 @@ namespace TWAINCLI
                 }
             }
 
-            // 3. 配置颜色模式 (bw/gray/color) [[19]]
+            // 3. Configure color mode (bw/gray/color) [[19]]
             if (source.Capabilities.ICapPixelType.IsSupported && !string.IsNullOrEmpty(config.ColorMode))
             {
-                Console.WriteLine("启用颜色模式");
+                Console.WriteLine("Setting color mode");
                 PixelType? pixelType = null;
                 string mode = config.ColorMode.ToLower();
                 if (mode == "bw" || mode == "blackandwhite" || mode == "1bit")
@@ -203,7 +204,7 @@ namespace TWAINCLI
                 {
                     pixelType = PixelType.RGB;
                 }
-                // 其他情况保持 null
+                // Keep null for other cases
                 if (pixelType.HasValue && source.Capabilities.ICapPixelType.CanSet &&
                     source.Capabilities.ICapPixelType.GetValues().Contains(pixelType.Value))
                 {
@@ -211,37 +212,37 @@ namespace TWAINCLI
                 }
             }
 
-            // 4. 配置分辨率 [[13]][[14]]
+            // 4. Configure resolution [[13]][[14]]
             if (config.Resolution > 0)
             {
-                Console.WriteLine("启用分辨率");
+                Console.WriteLine("Setting resolution");
                 if (source.Capabilities.ICapXResolution.IsSupported && source.Capabilities.ICapXResolution.CanSet)
                     source.Capabilities.ICapXResolution.SetValue(config.Resolution);
                 if (source.Capabilities.ICapYResolution.IsSupported && source.Capabilities.ICapYResolution.CanSet)
                     source.Capabilities.ICapYResolution.SetValue(config.Resolution);
             }
 
-            // 5. 配置双面扫描 [[12]]
-
+            // 5. Configure duplex scanning [[12]]
             if (source.Capabilities.CapDuplexEnabled.IsSupported && source.Capabilities.CapDuplexEnabled.CanSet)
             {
                 if (config.Duplex)
                 {
-                    Console.WriteLine("启用双面扫描");
+                    Console.WriteLine("Enabling duplex scanning");
                     source.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
                 }
-                else {
-                    Console.WriteLine("关闭双面扫描");
+                else
+                {
+                    Console.WriteLine("Disabling duplex scanning");
                     source.Capabilities.CapDuplexEnabled.SetValue(BoolType.False);
                 }
-                
             }
 
-            // 6. 配置扫描区域 (Frame) [[1]][[4]]
-            // TWAIN 的 Frame 坐标单位由 ICAP_UNITS 决定，默认为 Inches
+            // 6. Configure scan area (Frame) [[1]][[4]]
+            // TWAIN Frame coordinates unit is determined by ICAP_UNITS, default is Inches
+            // Note: Using ICapFrame (singular), not ICapFrames
             if (config.HasArea && source.Capabilities.ICapFrames.IsSupported && source.Capabilities.ICapFrames.CanSet)
             {
-                Console.WriteLine("设置区域");
+                Console.WriteLine("Setting scan area");
                 var frame = new TWFrame
                 {
                     Left = config.PageLeft,
@@ -252,7 +253,7 @@ namespace TWAINCLI
                 source.Capabilities.ICapFrames.SetValue(frame);
             }
 
-            // 7. 开启灯源（部分扫描仪需要）
+            // 7. Enable lamp (required by some scanners)
             if (source.Capabilities.ICapLampState.IsSupported && source.Capabilities.ICapLampState.CanSet)
             {
                 source.Capabilities.ICapLampState.SetValue(BoolType.True);
@@ -260,7 +261,7 @@ namespace TWAINCLI
         }
 
         /// <summary>
-        /// 列出所有可用扫描仪
+        /// List all available scanners
         /// </summary>
         private static void ListScanners()
         {
@@ -272,7 +273,7 @@ namespace TWAINCLI
                 var openResult = session.Open();
                 if (openResult != ReturnCode.Success)
                 {
-                    Console.WriteLine($"打开 TWAIN 会话失败: {openResult}");
+                    Console.WriteLine($"Failed to open TWAIN session: {openResult}");
                     return;
                 }
 
@@ -280,11 +281,11 @@ namespace TWAINCLI
 
                 if (sources.Count == 0)
                 {
-                    Console.WriteLine("未找到任何扫描仪");
+                    Console.WriteLine("No scanners found");
                 }
                 else
                 {
-                    Console.WriteLine("可用扫描仪列表:");
+                    Console.WriteLine("Available scanners:");
                     foreach (var source in sources)
                     {
                         Console.WriteLine($"  - {source.Name} (ID: {source.Id})");
@@ -295,21 +296,21 @@ namespace TWAINCLI
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"列出扫描仪时出错: {ex.Message}");
+                Console.WriteLine($"Error listing scanners: {ex.Message}");
             }
         }
 
         /// <summary>
-        /// 解析命令行参数
+        /// Parse command line arguments
         /// </summary>
         private static ScanConfig ParseArguments(string[] args)
         {
             var config = new ScanConfig
             {
                 OutputPath = @"C:\Users\hp\",
-                Resolution = 200,      // 默认分辨率 200 DPI
-                ColorMode = "color",   // 默认彩色
-                SourceType = "flatbed", // 默认平板
+                Resolution = 200,      // Default resolution 200 DPI
+                ColorMode = "color",   // Default color
+                SourceType = "flatbed", // Default flatbed
                 ScannerName = ""
             };
 
@@ -324,7 +325,7 @@ namespace TWAINCLI
                             config.PageLeft = left;
                         break;
 
-                    case "-t": // Page Top (原请求用-y，但与height冲突，改用-t)
+                    case "-t": // Page Top (changed from -y to avoid conflict with height)
                         if (i + 1 < args.Length && float.TryParse(args[++i], out float top))
                             config.PageTop = top;
                         break;
@@ -343,7 +344,7 @@ namespace TWAINCLI
                         if (i + 1 < args.Length)
                         {
                             config.OutputPath = args[++i];
-                            // 确保路径以分隔符结尾
+                            // Ensure path ends with separator
                             if (!config.OutputPath.EndsWith(@"\") && !config.OutputPath.EndsWith("/"))
                                 config.OutputPath += Path.DirectorySeparatorChar;
                         }
@@ -373,10 +374,10 @@ namespace TWAINCLI
                         config.Duplex = true;
                         break;
 
-                    case "-L": // List scanners (大写)
+                    case "-L": // List scanners (uppercase)
                         config.ListOnly = true;
                         break;
-                    case "--showUI": // List scanners (大写)
+                    case "--showUI": // Show native UI
                         config.ShowUI = true;
                         break;
                     case "-?":
@@ -386,10 +387,11 @@ namespace TWAINCLI
                         break;
                 }
             }
-            
-            // 判断是否设置了扫描区域
+
+            // Check if scan area is configured
             config.HasArea = config.PageWidth > 0 && config.PageHeight > 0;
-            if (config.ScannerName == "" && config.ListOnly == false) {
+            if (config.ScannerName == "" && config.ListOnly == false)
+            {
                 PrintHelp();
                 Environment.Exit(0);
             }
@@ -397,103 +399,103 @@ namespace TWAINCLI
         }
 
         /// <summary>
-        /// 打印帮助信息
+        /// Print help information
         /// </summary>
         private static void PrintHelp()
         {
-            Console.WriteLine("TWAIN CLI Scanner - 使用说明:");
-            Console.WriteLine("  -L                列出所有可用扫描仪");
-            Console.WriteLine("  -s <name>         指定源类型: feeder(进纸器), positive(正片), negative(负片), flatbed(平板)");
-            Console.WriteLine("  -d <name>         按名称指定扫描仪（支持部分匹配）");
-            Console.WriteLine("  -m <mode>         指定颜色模式: bw(黑白), gray(灰度), color(彩色)");
-            Console.WriteLine("  -r <resolution>   指定分辨率 DPI (默认: 200)");
-            Console.WriteLine("  -o <path>         输出文件/文件夹路径");
-            Console.WriteLine("  -l <left>         扫描区域左边距 (英寸)");
-            Console.WriteLine("  -t <top>          扫描区域上边距 (英寸)");
-            Console.WriteLine("  -x <width>        扫描区域宽度 (英寸)");
-            Console.WriteLine("  -y <height>       扫描区域高度 (英寸)");
-            Console.WriteLine("  --duplex          启用双面扫描");
-            Console.WriteLine("  --showUI          启用原生界面");
-            Console.WriteLine("  -?, --help        显示此帮助信息");
+            Console.WriteLine("TWAIN CLI Scanner - Usage:");
+            Console.WriteLine("  -L                List all available scanners");
+            Console.WriteLine("  -s <name>         Specify source type: feeder, positive, negative, flatbed");
+            Console.WriteLine("  -d <name>         Specify scanner by name (partial match supported)");
+            Console.WriteLine("  -m <mode>         Specify color mode: bw, gray, color");
+            Console.WriteLine("  -r <resolution>   Specify resolution in DPI (default: 200)");
+            Console.WriteLine("  -o <path>         Output file/folder path");
+            Console.WriteLine("  -l <left>         Scan area left margin (inches)");
+            Console.WriteLine("  -t <top>          Scan area top margin (inches)");
+            Console.WriteLine("  -x <width>        Scan area width (inches)");
+            Console.WriteLine("  -y <height>       Scan area height (inches)");
+            Console.WriteLine("  --duplex          Enable duplex scanning");
+            Console.WriteLine("  --showUI          Show native scanner UI");
+            Console.WriteLine("  -?, --help        Show this help message");
             Console.WriteLine();
-            Console.WriteLine("示例:");
+            Console.WriteLine("Examples:");
             Console.WriteLine("  TWAINCLI.exe -L");
             Console.WriteLine("  TWAINCLI.exe -d \"EPSON\" -s feeder -m color -r 300 -o C:\\Scans\\");
             Console.WriteLine("  TWAINCLI.exe -s negative -l 0 -t 0 -x 8.5 -y 11 --duplex");
         }
 
-        // ===== 事件处理程序 =====
+        // ===== Event Handlers =====
 
         private static void TwainSession_SourceDisabled(object sender, EventArgs e)
         {
-            Console.WriteLine("扫描完成或用户取消了扫描");
-            // 退出消息循环
+            Console.WriteLine("Scan completed or cancelled by user");
+            // Exit message loop
             Application.Exit();
         }
 
         private static void TwainSession_TransferReady(object sender, TransferReadyEventArgs e)
         {
-            Console.WriteLine("准备传输图像...");
-            e.CancelAll = false;  // 确保不取消传输
+            Console.WriteLine("Preparing to transfer image...");
+            e.CancelAll = false;  // Ensure transfer is not cancelled
         }
 
         private static void TwainSession_DataTransferred(object sender, DataTransferredEventArgs e)
         {
             try
             {
-                Console.WriteLine($"接收到数据，传输类型: {e.TransferType}");
+                Console.WriteLine($"Data received, transfer type: {e.TransferType}");
 
                 if (e.TransferType == XferMech.Native)
                 {
-                    // 处理 Native 传输类型（大多数扫描仪使用）[[31]]
+                    // Handle Native transfer type (used by most scanners) [[31]]
                     using (var stream = e.GetNativeImageStream())
                     {
                         if (stream != null)
                         {
                             using (var image = System.Drawing.Image.FromStream(stream))
                             {
-                                // 确保输出目录存在
+                                // Ensure output directory exists
                                 Directory.CreateDirectory(_outputPath);
 
-                                // 生成带时间戳的文件名
+                                // Generate filename with timestamp
                                 string fileName = Path.Combine(_outputPath,
                                     $"scan_{DateTime.Now:yyyyMMdd_HHmmss}_{_scanCount++}.jpg");
                                 image.Save(fileName, System.Drawing.Imaging.ImageFormat.Jpeg);
-                                Console.WriteLine($"图像已保存到: {fileName}");
+                                Console.WriteLine($"Image saved to: {fileName}");
                             }
                         }
                     }
                 }
                 else if (e.TransferType == XferMech.File)
                 {
-                    // 处理文件传输类型
-                    Console.WriteLine($"文件传输模式，文件路径: {e.FileDataPath}");
+                    // Handle file transfer type
+                    Console.WriteLine($"File transfer mode, file path: {e.FileDataPath}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"处理传输数据时出错: {ex.Message}");
+                Console.WriteLine($"Error processing transferred data: {ex.Message}");
             }
         }
     }
 
     /// <summary>
-    /// 扫描配置类
+    /// Scan configuration class
     /// </summary>
     internal class ScanConfig
     {
-        public bool ShowUI { get; set; }              // --showUI: 使用原生界面
-        public bool ListOnly { get; set; }              // -L: 仅列出扫描仪
-        public string ScannerName { get; set; }         // -d: 扫描仪名称
-        public string SourceType { get; set; } = "flatbed";  // -s: 源类型
-        public string ColorMode { get; set; } = "color";     // -m: 颜色模式
-        public int Resolution { get; set; } = 200;      // -r: 分辨率
-        public string OutputPath { get; set; }          // -o: 输出路径
-        public float PageLeft { get; set; } = 0;        // -l: 左边距
-        public float PageTop { get; set; } = 0;         // -t: 上边距
-        public float PageWidth { get; set; } = 0;       // -x: 宽度
-        public float PageHeight { get; set; } = 0;      // -y: 高度
-        public bool HasArea { get; set; }               // 是否设置了扫描区域
-        public bool Duplex { get; set; }                // --duplex: 双面扫描
+        public bool ShowUI { get; set; }              // --showUI: Use native scanner UI
+        public bool ListOnly { get; set; }            // -L: List scanners only
+        public string ScannerName { get; set; }       // -d: Scanner name
+        public string SourceType { get; set; } = "flatbed";  // -s: Source type
+        public string ColorMode { get; set; } = "color";     // -m: Color mode
+        public int Resolution { get; set; } = 200;      // -r: Resolution
+        public string OutputPath { get; set; }          // -o: Output path
+        public float PageLeft { get; set; } = 0;        // -l: Left margin
+        public float PageTop { get; set; } = 0;         // -t: Top margin
+        public float PageWidth { get; set; } = 0;       // -x: Width
+        public float PageHeight { get; set; } = 0;      // -y: Height
+        public bool HasArea { get; set; }               // Whether scan area is configured
+        public bool Duplex { get; set; }                // --duplex: Enable duplex scanning
     }
 }
