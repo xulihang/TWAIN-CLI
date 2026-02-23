@@ -223,10 +223,18 @@ namespace TWAINCLI
 
             // 5. 配置双面扫描 [[12]]
 
-            if (config.Duplex && source.Capabilities.CapDuplexEnabled.IsSupported && source.Capabilities.CapDuplexEnabled.CanSet)
+            if (source.Capabilities.CapDuplexEnabled.IsSupported && source.Capabilities.CapDuplexEnabled.CanSet)
             {
-                Console.WriteLine("启用双面扫描");
-                source.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
+                if (config.Duplex)
+                {
+                    Console.WriteLine("启用双面扫描");
+                    source.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
+                }
+                else {
+                    Console.WriteLine("关闭双面扫描");
+                    source.Capabilities.CapDuplexEnabled.SetValue(BoolType.False);
+                }
+                
             }
 
             // 6. 配置扫描区域 (Frame) [[1]][[4]]
