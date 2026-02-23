@@ -93,19 +93,34 @@ namespace TWAINCLI
                     var openDsResult = selectedSource.Open();
                     if (openDsResult == ReturnCode.Success)
                     {
-                        Console.WriteLine("扫描仪已打开，正在配置参数...");
-
-                        // 应用配置参数
-                        ConfigureSource(selectedSource, config);
-
-                        // 启用数据源进行扫描（无 UI 模式）[[21]]
-                        var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
-                        if (enableResult != ReturnCode.Success)
+                        if (config.ShowUI)
                         {
-                            Console.WriteLine($"启用扫描仪失败: {enableResult}");
-                            selectedSource.Close();
-                            return;
+                            Console.WriteLine("扫描仪已打开，显示原生界面...");
+                            // 启用数据源进行扫描（无 UI 模式）[[21]]
+                            var enableResult = selectedSource.Enable(SourceEnableMode.ShowUI, false, IntPtr.Zero);
+                            if (enableResult != ReturnCode.Success)
+                            {
+                                Console.WriteLine($"启用扫描仪失败: {enableResult}");
+                                selectedSource.Close();
+                                return;
+                            }
                         }
+                        else {
+                            Console.WriteLine("扫描仪已打开，正在配置参数...");
+
+                            // 应用配置参数
+                            ConfigureSource(selectedSource, config);
+
+                            // 启用数据源进行扫描（无 UI 模式）[[21]]
+                            var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
+                            if (enableResult != ReturnCode.Success)
+                            {
+                                Console.WriteLine($"启用扫描仪失败: {enableResult}");
+                                selectedSource.Close();
+                                return;
+                            }
+                        }
+                        
 
                         // 运行消息循环，等待扫描完成
                         Application.Run();
@@ -353,7 +368,9 @@ namespace TWAINCLI
                     case "-L": // List scanners (大写)
                         config.ListOnly = true;
                         break;
-
+                    case "--showUI": // List scanners (大写)
+                        config.ShowUI = true;
+                        break;
                     case "-?":
                     case "--help":
                         PrintHelp();
@@ -364,7 +381,7 @@ namespace TWAINCLI
             
             // 判断是否设置了扫描区域
             config.HasArea = config.PageWidth > 0 && config.PageHeight > 0;
-            if (config.ScannerName == "") {
+            if (config.ScannerName == "" && config.ListOnly == false) {
                 PrintHelp();
                 Environment.Exit(0);
             }
@@ -388,6 +405,7 @@ namespace TWAINCLI
             Console.WriteLine("  -x <width>        扫描区域宽度 (英寸)");
             Console.WriteLine("  -y <height>       扫描区域高度 (英寸)");
             Console.WriteLine("  --duplex          启用双面扫描");
+            Console.WriteLine("  --showUI          启用原生界面");
             Console.WriteLine("  -?, --help        显示此帮助信息");
             Console.WriteLine();
             Console.WriteLine("示例:");
@@ -456,6 +474,7 @@ namespace TWAINCLI
     /// </summary>
     internal class ScanConfig
     {
+        public bool ShowUI { get; set; }              // --showUI: 使用原生界面
         public bool ListOnly { get; set; }              // -L: 仅列出扫描仪
         public string ScannerName { get; set; }         // -d: 扫描仪名称
         public string SourceType { get; set; } = "flatbed";  // -s: 源类型
