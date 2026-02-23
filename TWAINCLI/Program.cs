@@ -25,7 +25,7 @@ namespace TWAINCLI
 
             // 解析命令行参数
             var config = ParseArguments(args);
-
+            _outputPath = config.OutputPath;
             // 如果只列出扫描仪，执行后退出
             if (config.ListOnly)
             {
