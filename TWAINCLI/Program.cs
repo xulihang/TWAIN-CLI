@@ -285,7 +285,8 @@ namespace TWAINCLI
                 OutputPath = @"C:\Users\hp\",
                 Resolution = 200,      // 默认分辨率 200 DPI
                 ColorMode = "color",   // 默认彩色
-                SourceType = "flatbed" // 默认平板
+                SourceType = "flatbed", // 默认平板
+                ScannerName = ""
             };
 
             for (int i = 0; i < args.Length; i++)
@@ -362,7 +363,10 @@ namespace TWAINCLI
 
             // 判断是否设置了扫描区域
             config.HasArea = config.PageWidth > 0 && config.PageHeight > 0;
-
+            if (config.ScannerName == "") {
+                PrintHelp();
+                Environment.Exit(0);
+            }
             return config;
         }
 
