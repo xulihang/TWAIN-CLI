@@ -5,7 +5,6 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Windows.Controls;
 using System.Windows.Forms;
 
 namespace TWAINCLI
@@ -13,8 +12,11 @@ namespace TWAINCLI
     internal class Program
     {
         private static TwainSession _session;
+        private static DataSource _selectedSource;          // [新增] 保存数据源引用用于取消
         private static string _outputPath = @"C:\Users\hp\";
         private static int _scanCount = 0;
+        private static volatile bool _cancelRequested = false;  // [新增] 取消标志（volatile保证线程可见性）
+        private static FileSystemWatcher _cancelWatcher = null; // [新增] 文件监控器
 
         [STAThread]
         static void Main(string[] args)
@@ -36,13 +38,13 @@ namespace TWAINCLI
 
             try
             {
-                // Create application identity [[31]]
+                // Create application identity
                 var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
 
                 // Create TWAIN session
                 _session = new TwainSession(appId);
 
-                // Register event handlers [[31]]
+                // Register event handlers
                 _session.TransferReady += TwainSession_TransferReady;
                 _session.DataTransferred += TwainSession_DataTransferred;
                 _session.SourceDisabled += TwainSession_SourceDisabled;
@@ -89,15 +91,15 @@ namespace TWAINCLI
                 if (selectedSource != null)
                 {
                     Console.WriteLine($"\nSelected scanner: {selectedSource.Name}");
+                    _selectedSource = selectedSource;  // [新增] 保存引用用于后续取消
 
-                    // Open data source [[21]]
+                    // Open data source
                     var openDsResult = selectedSource.Open();
                     if (openDsResult == ReturnCode.Success)
                     {
                         if (config.ShowUI)
                         {
                             Console.WriteLine("Scanner opened, showing native UI...");
-                            // Enable data source for scanning (with UI mode) [[21]]
                             var enableResult = selectedSource.Enable(SourceEnableMode.ShowUI, false, IntPtr.Zero);
                             if (enableResult != ReturnCode.Success)
                             {
@@ -113,7 +115,7 @@ namespace TWAINCLI
                             // Apply configuration parameters
                             ConfigureSource(selectedSource, config);
 
-                            // Enable data source for scanning (no UI mode) [[21]]
+                            // Enable data source for scanning (no UI mode)
                             var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
                             if (enableResult != ReturnCode.Success)
                             {
@@ -122,6 +124,9 @@ namespace TWAINCLI
                                 return;
                             }
                         }
+
+                        // [新增] 启动取消文件监控
+                        StartCancelMonitoring(config.CancelFileName);
 
                         // Run message loop, wait for scan completion
                         Application.Run();
@@ -144,6 +149,9 @@ namespace TWAINCLI
             }
             finally
             {
+                // [新增] 停止取消文件监控
+                StopCancelMonitoring();
+
                 if (_session != null)
                 {
                     _session.Close();
@@ -153,7 +161,82 @@ namespace TWAINCLI
         }
 
         /// <summary>
-        /// Configure scanner TWAIN Capabilities [[12]][[13]]
+        /// [新增] 启动取消文件监控
+        /// </summary>
+        private static void StartCancelMonitoring(string cancelFileName)
+        {
+            _cancelRequested = false;
+
+            if (_cancelWatcher != null)
+            {
+                _cancelWatcher.Dispose();
+                _cancelWatcher = null;
+            }
+
+            string watchDir = AppDomain.CurrentDomain.BaseDirectory;
+            string fileName = string.IsNullOrEmpty(cancelFileName) ? "cancel" : cancelFileName;
+
+            _cancelWatcher = new FileSystemWatcher(watchDir, fileName)
+            {
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+                EnableRaisingEvents = true
+            };
+
+            _cancelWatcher.Created += (s, e) =>
+            {
+                Console.WriteLine("⚠ Cancel file detected, requesting scan cancellation...");
+                _cancelRequested = true;
+
+                // 尝试立即取消数据源（如果已启用）
+                if (_selectedSource != null && _selectedSource.IsOpen)
+                {
+                    try
+                    {
+                        _selectedSource.Close();
+                        Console.WriteLine("🔌 Scanner source closed");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠ Error closing source: {ex.Message}");
+                    }
+                }
+
+                // 退出消息循环
+                Application.Exit();
+            };
+
+            // 兼容：如果cancel文件已存在，也触发取消
+            if (File.Exists(Path.Combine(watchDir, fileName)))
+            {
+                Console.WriteLine("⚠ Cancel file already exists, requesting cancellation...");
+                _cancelRequested = true;
+            }
+        }
+
+        /// <summary>
+        /// [新增] 停止取消文件监控
+        /// </summary>
+        private static void StopCancelMonitoring()
+        {
+            if (_cancelWatcher != null)
+            {
+                _cancelWatcher.EnableRaisingEvents = false;
+                _cancelWatcher.Dispose();
+                _cancelWatcher = null;
+            }
+
+            // 可选：自动删除cancel文件，避免下次误触发
+            try
+            {
+                string cancelPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cancel");
+                if (File.Exists(cancelPath))
+                    File.Delete(cancelPath);
+            }
+            catch { /* 忽略删除异常 */ }
+        }
+
+        /// <summary>
+        /// Configure scanner TWAIN Capabilities
         /// </summary>
         private static void ConfigureSource(DataSource source, ScanConfig config)
         {
@@ -164,7 +247,7 @@ namespace TWAINCLI
                 source.Capabilities.CapFeederEnabled.SetValue(useFeeder ? BoolType.True : BoolType.False);
             }
 
-            // 2. Configure light path (positive/negative/flatbed) [[19]]
+            // 2. Configure light path (positive/negative/flatbed)
             if (source.Capabilities.ICapLightPath.IsSupported && !string.IsNullOrEmpty(config.SourceType))
             {
                 switch (config.SourceType.ToLower())
@@ -186,7 +269,7 @@ namespace TWAINCLI
                 }
             }
 
-            // 3. Configure color mode (bw/gray/color) [[19]]
+            // 3. Configure color mode (bw/gray/color)
             if (source.Capabilities.ICapPixelType.IsSupported && !string.IsNullOrEmpty(config.ColorMode))
             {
                 Console.WriteLine("Setting color mode");
@@ -204,7 +287,6 @@ namespace TWAINCLI
                 {
                     pixelType = PixelType.RGB;
                 }
-                // Keep null for other cases
                 if (pixelType.HasValue && source.Capabilities.ICapPixelType.CanSet &&
                     source.Capabilities.ICapPixelType.GetValues().Contains(pixelType.Value))
                 {
@@ -212,7 +294,7 @@ namespace TWAINCLI
                 }
             }
 
-            // 4. Configure resolution [[13]][[14]]
+            // 4. Configure resolution
             if (config.Resolution > 0)
             {
                 Console.WriteLine("Setting resolution");
@@ -222,7 +304,7 @@ namespace TWAINCLI
                     source.Capabilities.ICapYResolution.SetValue(config.Resolution);
             }
 
-            // 5. Configure duplex scanning [[12]]
+            // 5. Configure duplex scanning
             if (source.Capabilities.CapDuplexEnabled.IsSupported && source.Capabilities.CapDuplexEnabled.CanSet)
             {
                 if (config.Duplex)
@@ -237,9 +319,7 @@ namespace TWAINCLI
                 }
             }
 
-            // 6. Configure scan area (Frame) [[1]][[4]]
-            // TWAIN Frame coordinates unit is determined by ICAP_UNITS, default is Inches
-            // Note: Using ICapFrame (singular), not ICapFrames
+            // 6. Configure scan area (Frame)
             if (config.HasArea && source.Capabilities.ICapFrames.IsSupported && source.Capabilities.ICapFrames.CanSet)
             {
                 Console.WriteLine("Setting scan area");
@@ -308,10 +388,11 @@ namespace TWAINCLI
             var config = new ScanConfig
             {
                 OutputPath = @"C:\Users\hp\",
-                Resolution = 200,      // Default resolution 200 DPI
-                ColorMode = "color",   // Default color
-                SourceType = "flatbed", // Default flatbed
-                ScannerName = ""
+                Resolution = 200,
+                ColorMode = "color",
+                SourceType = "flatbed",
+                ScannerName = "",
+                CancelFileName = "cancel"  // [新增] 默认取消文件名
             };
 
             for (int i = 0; i < args.Length; i++)
@@ -320,66 +401,72 @@ namespace TWAINCLI
 
                 switch (arg)
                 {
-                    case "-l": // Page Left
+                    case "-l":
                         if (i + 1 < args.Length && float.TryParse(args[++i], out float left))
                             config.PageLeft = left;
                         break;
 
-                    case "-t": // Page Top (changed from -y to avoid conflict with height)
+                    case "-t":
                         if (i + 1 < args.Length && float.TryParse(args[++i], out float top))
                             config.PageTop = top;
                         break;
 
-                    case "-x": // Page Width
+                    case "-x":
                         if (i + 1 < args.Length && float.TryParse(args[++i], out float width))
                             config.PageWidth = width;
                         break;
 
-                    case "-y": // Page Height
+                    case "-y":
                         if (i + 1 < args.Length && float.TryParse(args[++i], out float height))
                             config.PageHeight = height;
                         break;
 
-                    case "-o": // Output Path
+                    case "-o":
                         if (i + 1 < args.Length)
                         {
                             config.OutputPath = args[++i];
-                            // Ensure path ends with separator
                             if (!config.OutputPath.EndsWith(@"\") && !config.OutputPath.EndsWith("/"))
                                 config.OutputPath += Path.DirectorySeparatorChar;
                         }
                         break;
 
-                    case "-m": // Color Mode
+                    case "-m":
                         if (i + 1 < args.Length)
                             config.ColorMode = args[++i];
                         break;
 
-                    case "-r": // Resolution
+                    case "-r":
                         if (i + 1 < args.Length && int.TryParse(args[++i], out int res) && res > 0)
                             config.Resolution = res;
                         break;
 
-                    case "-s": // Source Type
+                    case "-s":
                         if (i + 1 < args.Length)
                             config.SourceType = args[++i];
                         break;
 
-                    case "-d": // Scanner Name
+                    case "-d":
                         if (i + 1 < args.Length)
                             config.ScannerName = args[++i];
                         break;
 
-                    case "--duplex": // Duplex
+                    case "--duplex":
                         config.Duplex = true;
                         break;
 
-                    case "-L": // List scanners (uppercase)
+                    case "-L":
                         config.ListOnly = true;
                         break;
-                    case "--showUI": // Show native UI
+
+                    case "--showUI":
                         config.ShowUI = true;
                         break;
+
+                    case "--cancelFile":  // [新增] 自定义取消文件名
+                        if (i + 1 < args.Length)
+                            config.CancelFileName = args[++i];
+                        break;
+
                     case "-?":
                     case "--help":
                         PrintHelp();
@@ -388,7 +475,6 @@ namespace TWAINCLI
                 }
             }
 
-            // Check if scan area is configured
             config.HasArea = config.PageWidth > 0 && config.PageHeight > 0;
             if (config.ScannerName == "" && config.ListOnly == false)
             {
@@ -404,60 +490,83 @@ namespace TWAINCLI
         private static void PrintHelp()
         {
             Console.WriteLine("TWAIN CLI Scanner - Usage:");
-            Console.WriteLine("  -L                List all available scanners");
-            Console.WriteLine("  -s <name>         Specify source type: feeder, positive, negative, flatbed");
-            Console.WriteLine("  -d <name>         Specify scanner by name (partial match supported)");
-            Console.WriteLine("  -m <mode>         Specify color mode: bw, gray, color");
-            Console.WriteLine("  -r <resolution>   Specify resolution in DPI (default: 200)");
-            Console.WriteLine("  -o <path>         Output file/folder path");
-            Console.WriteLine("  -l <left>         Scan area left margin (inches)");
-            Console.WriteLine("  -t <top>          Scan area top margin (inches)");
-            Console.WriteLine("  -x <width>        Scan area width (inches)");
-            Console.WriteLine("  -y <height>       Scan area height (inches)");
-            Console.WriteLine("  --duplex          Enable duplex scanning");
-            Console.WriteLine("  --showUI          Show native scanner UI");
-            Console.WriteLine("  -?, --help        Show this help message");
+            Console.WriteLine("  -L                    List all available scanners");
+            Console.WriteLine("  -s <name>             Specify source type: feeder, positive, negative, flatbed");
+            Console.WriteLine("  -d <name>             Specify scanner by name (partial match supported)");
+            Console.WriteLine("  -m <mode>             Specify color mode: bw, gray, color");
+            Console.WriteLine("  -r <resolution>       Specify resolution in DPI (default: 200)");
+            Console.WriteLine("  -o <path>             Output file/folder path");
+            Console.WriteLine("  -l <left>             Scan area left margin (inches)");
+            Console.WriteLine("  -t <top>              Scan area top margin (inches)");
+            Console.WriteLine("  -x <width>            Scan area width (inches)");
+            Console.WriteLine("  -y <height>           Scan area height (inches)");
+            Console.WriteLine("  --duplex              Enable duplex scanning");
+            Console.WriteLine("  --showUI              Show native scanner UI");
+            Console.WriteLine("  --cancelFile <name>   Custom cancel trigger filename (default: cancel)");
+            Console.WriteLine("  -?, --help            Show this help message");
+            Console.WriteLine();
+            Console.WriteLine("Cancel scanning:");
+            Console.WriteLine("  Create a file named 'cancel' in the program directory:");
+            Console.WriteLine("    cmd:     echo. > cancel");
+            Console.WriteLine("    powershell: New-Item -Path . -Name cancel -ItemType File");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  TWAINCLI.exe -L");
             Console.WriteLine("  TWAINCLI.exe -d \"EPSON\" -s feeder -m color -r 300 -o C:\\Scans\\");
             Console.WriteLine("  TWAINCLI.exe -s negative -l 0 -t 0 -x 8.5 -y 11 --duplex");
+            Console.WriteLine("  TWAINCLI.exe -d \"EPSON\" --cancelFile stop.scan  (use 'stop.scan' to cancel)");
         }
 
         // ===== Event Handlers =====
 
         private static void TwainSession_SourceDisabled(object sender, EventArgs e)
         {
-            Console.WriteLine("Scan completed or cancelled by user");
+            if (_cancelRequested)
+                Console.WriteLine("✅ Scan cancelled by user");
+            else
+                Console.WriteLine("✅ Scan completed");
+
             // Exit message loop
             Application.Exit();
         }
 
         private static void TwainSession_TransferReady(object sender, TransferReadyEventArgs e)
         {
+            // [新增] 检查是否请求取消
+            if (_cancelRequested)
+            {
+                Console.WriteLine("🚫 Transfer cancelled by user request");
+                e.CancelAll = true;
+                return;
+            }
+
             Console.WriteLine("Preparing to transfer image...");
-            e.CancelAll = false;  // Ensure transfer is not cancelled
+            e.CancelAll = false;
         }
 
         private static void TwainSession_DataTransferred(object sender, DataTransferredEventArgs e)
         {
+            // [新增] 如果已取消，跳过处理
+            if (_cancelRequested)
+            {
+                Console.WriteLine("⚠ Data transfer ignored (cancel requested)");
+                return;
+            }
+
             try
             {
                 Console.WriteLine($"Data received, transfer type: {e.TransferType}");
 
                 if (e.TransferType == XferMech.Native)
                 {
-                    // Handle Native transfer type (used by most scanners) [[31]]
                     using (var stream = e.GetNativeImageStream())
                     {
                         if (stream != null)
                         {
                             using (var image = System.Drawing.Image.FromStream(stream))
                             {
-                                // Ensure output directory exists
                                 Directory.CreateDirectory(_outputPath);
 
-                                // Generate filename with timestamp
                                 string fileName = Path.Combine(_outputPath,
                                     $"scan_{DateTime.Now:yyyyMMdd_HHmmss}_{_scanCount++}.jpg");
                                 image.Save(fileName, System.Drawing.Imaging.ImageFormat.Jpeg);
@@ -468,7 +577,6 @@ namespace TWAINCLI
                 }
                 else if (e.TransferType == XferMech.File)
                 {
-                    // Handle file transfer type
                     Console.WriteLine($"File transfer mode, file path: {e.FileDataPath}");
                 }
             }
@@ -484,18 +592,19 @@ namespace TWAINCLI
     /// </summary>
     internal class ScanConfig
     {
-        public bool ShowUI { get; set; }              // --showUI: Use native scanner UI
-        public bool ListOnly { get; set; }            // -L: List scanners only
-        public string ScannerName { get; set; }       // -d: Scanner name
-        public string SourceType { get; set; } = "flatbed";  // -s: Source type
-        public string ColorMode { get; set; } = "color";     // -m: Color mode
-        public int Resolution { get; set; } = 200;      // -r: Resolution
-        public string OutputPath { get; set; }          // -o: Output path
-        public float PageLeft { get; set; } = 0;        // -l: Left margin
-        public float PageTop { get; set; } = 0;         // -t: Top margin
-        public float PageWidth { get; set; } = 0;       // -x: Width
-        public float PageHeight { get; set; } = 0;      // -y: Height
-        public bool HasArea { get; set; }               // Whether scan area is configured
-        public bool Duplex { get; set; }                // --duplex: Enable duplex scanning
+        public bool ShowUI { get; set; }
+        public bool ListOnly { get; set; }
+        public string ScannerName { get; set; }
+        public string SourceType { get; set; } = "flatbed";
+        public string ColorMode { get; set; } = "color";
+        public int Resolution { get; set; } = 200;
+        public string OutputPath { get; set; }
+        public float PageLeft { get; set; } = 0;
+        public float PageTop { get; set; } = 0;
+        public float PageWidth { get; set; } = 0;
+        public float PageHeight { get; set; } = 0;
+        public bool HasArea { get; set; }
+        public bool Duplex { get; set; }
+        public string CancelFileName { get; set; } = "cancel";  // [新增] 取消触发文件名
     }
 }
