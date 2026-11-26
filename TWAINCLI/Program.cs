@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
@@ -40,6 +41,18 @@ namespace TWAINCLI
         private static long _lastProgressReportMs = 0;
         private static int _lastReportedPercent = -1;
 
+        // [新增] 实时预览（周期快照）
+        private static string _previewPath = null;
+        private static int _previewIntervalMs = 500;
+        private static int _previewMaxWidth = 800;
+        private static long _lastPreviewMs = 0;
+        private static bool _previewErrorShown = false;
+        private static Bitmap _previewBitmap = null;              // 增量绘制的预览图
+        private static double _previewScale = 1.0;
+        private static int _previewPageWidth = 0;
+        private static int _previewPageHeight = 0;
+        private static bool _unalignedWarningShown = false;
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -50,6 +63,9 @@ namespace TWAINCLI
             // Parse command line arguments
             var config = ParseArguments(args);
             _outputPath = config.OutputPath;
+            _previewPath = config.PreviewPath;
+            _previewIntervalMs = config.PreviewIntervalMs;
+            _previewMaxWidth = config.PreviewMaxWidth;
 
             // If only listing scanners, execute and exit
             if (config.ListOnly)
@@ -381,6 +397,7 @@ namespace TWAINCLI
             if (config.NativeTransfer)
             {
                 Console.WriteLine("Transfer mode: Native (requested), no progress percentage");
+                WarnPreviewRequiresMemory(config);
                 return;
             }
 
@@ -389,6 +406,7 @@ namespace TWAINCLI
                 (ContainsIgnoreCase(source.ProductFamily, "Ecosys") || ContainsIgnoreCase(source.Name, "Ecosys")))
             {
                 Console.WriteLine("Transfer mode: Native (Kyocera Ecosys, memory transfer known to be broken)");
+                WarnPreviewRequiresMemory(config);
                 return;
             }
 
@@ -409,6 +427,13 @@ namespace TWAINCLI
             }
 
             Console.WriteLine("Transfer mode: Native (memory transfer not supported), no progress percentage");
+            WarnPreviewRequiresMemory(config);
+        }
+
+        private static void WarnPreviewRequiresMemory(ScanConfig config)
+        {
+            if (!string.IsNullOrEmpty(config.PreviewPath))
+                Console.WriteLine("⚠ Live preview requires memory transfer; preview will be written when the scan completes");
         }
 
         private static bool ContainsIgnoreCase(string value, string part)
@@ -548,6 +573,21 @@ namespace TWAINCLI
                         config.NativeTransfer = true;
                         break;
 
+                    case "--preview":  // [新增] 实时预览输出路径
+                        if (i + 1 < args.Length)
+                            config.PreviewPath = args[++i];
+                        break;
+
+                    case "--previewInterval":  // [新增] 预览刷新间隔（毫秒）
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out int previewInterval) && previewInterval >= 100)
+                            config.PreviewIntervalMs = previewInterval;
+                        break;
+
+                    case "--previewWidth":  // [新增] 预览最大宽度（像素，0 = 原始尺寸）
+                        if (i + 1 < args.Length && int.TryParse(args[++i], out int previewWidth) && previewWidth >= 0)
+                            config.PreviewMaxWidth = previewWidth;
+                        break;
+
                     case "-?":
                     case "--help":
                         PrintHelp();
@@ -584,6 +624,9 @@ namespace TWAINCLI
             Console.WriteLine("  --duplex              Enable duplex scanning");
             Console.WriteLine("  --showUI              Show native scanner UI");
             Console.WriteLine("  --native              Force native transfer (no progress percentage)");
+            Console.WriteLine("  --preview <path>      Live preview JPEG updated while scanning (memory transfer only)");
+            Console.WriteLine("  --previewInterval <ms> Preview refresh interval (default: 500)");
+            Console.WriteLine("  --previewWidth <px>   Max preview width (default: 800, 0 = full size)");
             Console.WriteLine("  --cancelFile <name>   Custom cancel trigger filename (default: cancel)");
             Console.WriteLine("  -?, --help            Show this help message");
             Console.WriteLine();
@@ -701,6 +744,8 @@ namespace TWAINCLI
             _totalPixels = 0;
             _lastReportedPercent = -1;
             _lastProgressReportMs = 0;
+            _lastPreviewMs = 0;
+            ResetPreviewBitmap();
             _pageWidth = 0;
             _pageHeight = 0;
             _pageBitsPerPixel = 0;
@@ -727,6 +772,9 @@ namespace TWAINCLI
                 _totalPixels = (long)_pageWidth * _pageHeight;
             else
                 _totalPixels = _estimatedTotalPixels;
+
+            if (_pageBitsPerPixel <= 0)
+                Console.WriteLine("⚠ Image info unavailable, assuming 24-bit RGB");
         }
 
         /// <summary>
@@ -765,7 +813,7 @@ namespace TWAINCLI
                 return;
             }
 
-            _chunks.Add(new MemoryChunk
+            var chunk = new MemoryChunk
             {
                 Data = data,
                 Columns = (int)columns,
@@ -773,10 +821,13 @@ namespace TWAINCLI
                 XOffset = (int)mem.XOffset,
                 YOffset = (int)mem.YOffset,
                 BytesPerRow = (int)bytesPerRow
-            });
+            };
+            _chunks.Add(chunk);
 
             _transferredPixels += (long)columns * rows;
             ReportPixelProgress();
+            RenderChunkToPreview(chunk);
+            MaybeWritePreview();
         }
 
         private static void ReportPixelProgress()
@@ -852,25 +903,14 @@ namespace TWAINCLI
                     return;
                 }
 
-                int width = Math.Max(_pageWidth, 0);
-                int height = Math.Max(_pageHeight, 0);
-                foreach (var chunk in _chunks)
+                using (var bitmap = BuildPageBitmap(out int contentWidth, out int contentHeight))
                 {
-                    width = Math.Max(width, chunk.XOffset + chunk.Columns);
-                    height = Math.Max(height, chunk.YOffset + chunk.Rows);
-                }
+                    if (bitmap == null)
+                        return;
 
-                if (width <= 0 || height <= 0)
-                {
-                    Console.WriteLine($"\r⚠ Page {_pageNumber}: invalid image size {width}x{height}          ");
-                    return;
-                }
-
-                using (var bitmap = CreatePageBitmap(width, height))
-                {
-                    CopyChunksToBitmap(bitmap, width, height);
                     ReportPageCompletion();
                     SaveBitmapAsJpeg(bitmap);
+                    UpdatePreview(bitmap, contentWidth, contentHeight);
                 }
             }
             catch (Exception ex)
@@ -883,6 +923,7 @@ namespace TWAINCLI
                 _chunks.Clear();
                 _compressedBytes?.Dispose();
                 _compressedBytes = null;
+                ResetPreviewBitmap();
             }
         }
 
@@ -893,6 +934,313 @@ namespace TWAINCLI
             _chunks.Clear();
             _compressedBytes?.Dispose();
             _compressedBytes = null;
+            ResetPreviewBitmap();
+        }
+
+        /// <summary>
+        /// [新增] 用当前已接收的分块构建整页位图
+        /// </summary>
+        private static Bitmap BuildPageBitmap(out int contentWidth, out int contentHeight)
+        {
+            contentWidth = 0;
+            contentHeight = 0;
+
+            int width = Math.Max(_pageWidth, 0);
+            int height = Math.Max(_pageHeight, 0);
+            foreach (var chunk in _chunks)
+            {
+                contentWidth = Math.Max(contentWidth, chunk.XOffset + chunk.Columns);
+                contentHeight = Math.Max(contentHeight, chunk.YOffset + chunk.Rows);
+            }
+            width = Math.Max(width, contentWidth);
+            height = Math.Max(height, contentHeight);
+
+            if (width <= 0 || height <= 0)
+            {
+                Console.WriteLine($"\r⚠ Page {_pageNumber}: invalid image size {width}x{height}          ");
+                return null;
+            }
+
+            var bitmap = CreatePageBitmap(width, height);
+            try
+            {
+                CopyChunksToBitmap(bitmap, width, height);
+                return bitmap;
+            }
+            catch
+            {
+                bitmap.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// [新增] 按时间间隔把当前预览图写成一张完整的 JPEG，供第三方程序轮询显示
+        /// </summary>
+        private static void MaybeWritePreview()
+        {
+            if (string.IsNullOrEmpty(_previewPath))
+                return;
+
+            long now = _pageStopwatch == null ? 0 : _pageStopwatch.ElapsedMilliseconds;
+            if (now - _lastPreviewMs < _previewIntervalMs)
+                return;
+            _lastPreviewMs = now;
+
+            try
+            {
+                if (_previewBitmap != null)
+                {
+                    SavePreviewBitmap();
+                }
+                else if (_chunks.Count > 0)
+                {
+                    // 拿不到整页尺寸时退化为按分块重建
+                    using (var bitmap = BuildPageBitmap(out int contentWidth, out int contentHeight))
+                    {
+                        if (bitmap != null)
+                            UpdatePreview(bitmap, contentWidth, contentHeight);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ShowPreviewError(ex);
+            }
+        }
+
+        private static void SavePreviewBitmap()
+        {
+            if (_previewBitmap == null)
+                return;
+
+            string fullPath = Path.GetFullPath(_previewPath);
+            string dir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+            string tempPath = fullPath + ".tmp";
+
+            _previewBitmap.Save(tempPath, ImageFormat.Jpeg);
+            ReplaceFile(tempPath, fullPath);
+        }
+
+        /// <summary>
+        /// [新增] 把新到达的一块数据直接画进预览图（增量绘制，避免每次重建整页）
+        /// </summary>
+        private static void RenderChunkToPreview(MemoryChunk chunk)
+        {
+            if (string.IsNullOrEmpty(_previewPath))
+                return;
+
+            try
+            {
+                if (!EnsurePreviewBitmap())
+                    return;
+
+                int contentWidth = chunk.XOffset + chunk.Columns;
+                int contentHeight = chunk.YOffset + chunk.Rows;
+                if (contentWidth > _previewPageWidth || contentHeight > _previewPageHeight)
+                {
+                    // 实际内容超出驱动声明的尺寸：按新尺寸重建预览并重绘已有分块
+                    RebuildPreviewBitmap(
+                        Math.Max(_previewPageWidth, contentWidth),
+                        Math.Max(_previewPageHeight, contentHeight));
+                    return;
+                }
+
+                DrawChunkScaled(chunk);
+            }
+            catch (Exception ex)
+            {
+                ShowPreviewError(ex);
+            }
+        }
+
+        private static bool EnsurePreviewBitmap()
+        {
+            if (_previewBitmap != null)
+                return true;
+
+            int pageWidth = Math.Max(_pageWidth, 0);
+            int pageHeight = Math.Max(_pageHeight, 0);
+            if (pageWidth <= 0 || pageHeight <= 0)
+                return false;
+
+            AllocatePreviewBitmap(pageWidth, pageHeight);
+            return true;
+        }
+
+        private static void AllocatePreviewBitmap(int pageWidth, int pageHeight)
+        {
+            _previewBitmap?.Dispose();
+            _previewPageWidth = pageWidth;
+            _previewPageHeight = pageHeight;
+
+            int width = pageWidth;
+            int height = pageHeight;
+            if (_previewMaxWidth > 0 && width > _previewMaxWidth)
+            {
+                _previewScale = (double)_previewMaxWidth / width;
+                width = _previewMaxWidth;
+                height = Math.Max(1, (int)Math.Round(pageHeight * _previewScale));
+            }
+            else
+            {
+                _previewScale = 1.0;
+            }
+
+            _previewBitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(_previewBitmap))
+            {
+                g.Clear(Color.White);
+            }
+        }
+
+        private static void RebuildPreviewBitmap(int pageWidth, int pageHeight)
+        {
+            AllocatePreviewBitmap(pageWidth, pageHeight);
+            foreach (var chunk in _chunks)
+                DrawChunkScaled(chunk);
+        }
+
+        private static void DrawChunkScaled(MemoryChunk chunk)
+        {
+            if (_previewBitmap == null)
+                return;
+
+            int destX = (int)Math.Floor(chunk.XOffset * _previewScale);
+            int destY = (int)Math.Floor(chunk.YOffset * _previewScale);
+            int destRight = (int)Math.Ceiling((chunk.XOffset + chunk.Columns) * _previewScale);
+            int destBottom = (int)Math.Ceiling((chunk.YOffset + chunk.Rows) * _previewScale);
+
+            if (destX < 0 || destY < 0 || destX >= _previewBitmap.Width || destY >= _previewBitmap.Height)
+                return;
+
+            int destWidth = Math.Min(_previewBitmap.Width - destX, Math.Max(1, destRight - destX));
+            int destHeight = Math.Min(_previewBitmap.Height - destY, Math.Max(1, destBottom - destY));
+            if (destWidth <= 0 || destHeight <= 0)
+                return;
+
+            using (var chunkBitmap = CreateChunkBitmap(chunk))
+            using (var g = Graphics.FromImage(_previewBitmap))
+            {
+                g.InterpolationMode = InterpolationMode.Bilinear;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(chunkBitmap,
+                    new Rectangle(destX, destY, destWidth, destHeight),
+                    new Rectangle(0, 0, chunk.Columns, chunk.Rows),
+                    GraphicsUnit.Pixel);
+            }
+        }
+
+        private static Bitmap CreateChunkBitmap(MemoryChunk chunk)
+        {
+            var bitmap = CreatePageBitmap(chunk.Columns, chunk.Rows);
+            bool isRgb = bitmap.PixelFormat == PixelFormat.Format24bppRgb;
+            bool isBw = bitmap.PixelFormat == PixelFormat.Format1bppIndexed;
+
+            var locked = bitmap.LockBits(new Rectangle(0, 0, chunk.Columns, chunk.Rows),
+                ImageLockMode.WriteOnly, bitmap.PixelFormat);
+            try
+            {
+                CopyChunkRows(locked, isRgb, isBw, chunk, 0, 0);
+            }
+            finally
+            {
+                bitmap.UnlockBits(locked);
+            }
+            return bitmap;
+        }
+
+        private static void ResetPreviewBitmap()
+        {
+            _previewBitmap?.Dispose();
+            _previewBitmap = null;
+            _previewScale = 1.0;
+            _previewPageWidth = 0;
+            _previewPageHeight = 0;
+        }
+
+        /// <summary>
+        /// [新增] 将已接收部分缩放后原子写入预览文件（始终是一张有效的完整 JPEG）
+        /// </summary>
+        private static void UpdatePreview(System.Drawing.Image source, int sourceWidth, int sourceHeight)
+        {
+            if (string.IsNullOrEmpty(_previewPath) || source == null)
+                return;
+
+            try
+            {
+                if (sourceWidth <= 0 || sourceHeight <= 0)
+                {
+                    sourceWidth = source.Width;
+                    sourceHeight = source.Height;
+                }
+                sourceWidth = Math.Min(sourceWidth, source.Width);
+                sourceHeight = Math.Min(sourceHeight, source.Height);
+
+                int width = sourceWidth;
+                int height = sourceHeight;
+                if (_previewMaxWidth > 0 && width > _previewMaxWidth)
+                {
+                    double scale = (double)_previewMaxWidth / width;
+                    width = Math.Max(1, (int)Math.Round(width * scale));
+                    height = Math.Max(1, (int)Math.Round(height * scale));
+                }
+
+                string fullPath = Path.GetFullPath(_previewPath);
+                string dir = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                string tempPath = fullPath + ".tmp";
+
+                using (var preview = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+                {
+                    using (var g = Graphics.FromImage(preview))
+                    {
+                        g.Clear(Color.White);
+                        g.InterpolationMode = InterpolationMode.Bilinear;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.DrawImage(source,
+                            new Rectangle(0, 0, width, height),
+                            new Rectangle(0, 0, sourceWidth, sourceHeight),
+                            GraphicsUnit.Pixel);
+                    }
+                    preview.Save(tempPath, ImageFormat.Jpeg);
+                }
+
+                ReplaceFile(tempPath, fullPath);
+            }
+            catch (Exception ex)
+            {
+                ShowPreviewError(ex);
+            }
+        }
+
+        private static void ReplaceFile(string tempPath, string targetPath)
+        {
+            try
+            {
+                if (File.Exists(targetPath))
+                    File.Replace(tempPath, targetPath, null);
+                else
+                    File.Move(tempPath, targetPath);
+            }
+            catch (IOException)
+            {
+                // 目标文件可能正被第三方程序占用，保留临时文件，下次预览时覆盖
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        private static void ShowPreviewError(Exception ex)
+        {
+            if (_previewErrorShown)
+                return;
+            _previewErrorShown = true;
+            Console.WriteLine($"\r⚠ Preview update failed: {ex.Message}          ");
         }
 
         /// <summary>
@@ -926,7 +1274,6 @@ namespace TWAINCLI
             if (_pageBitsPerPixel == 0)
             {
                 // 拿不到位深时按最常见的 24 位彩色处理
-                Console.WriteLine("\r⚠ Image info unavailable, assuming 24-bit RGB          ");
                 return new Bitmap(width, height, PixelFormat.Format24bppRgb);
             }
 
@@ -950,55 +1297,67 @@ namespace TWAINCLI
                 foreach (var chunk in _chunks)
                 {
                     int destX = isBw ? chunk.XOffset / 8 : chunk.XOffset * bytesPerPixel;
-                    if (isBw && chunk.XOffset % 8 != 0)
-                    {
-                        Console.WriteLine($"\r⚠ 1-bit chunk with unaligned XOffset={chunk.XOffset}, image may be misaligned");
-                    }
-
-                    int rowBytes = isBw
-                        ? Math.Min((chunk.Columns + 7) / 8, chunk.BytesPerRow)
-                        : Math.Min(chunk.Columns * bytesPerPixel, chunk.BytesPerRow);
-                    rowBytes = Math.Min(rowBytes, locked.Stride - destX);
-                    if (rowBytes <= 0)
-                        continue;
-
-                    byte[] swap = isRgb ? new byte[rowBytes] : null;
-
-                    for (int row = 0; row < chunk.Rows; row++)
-                    {
-                        int destY = chunk.YOffset + row;
-                        if (destY >= height)
-                            break;
-
-                        int srcOffset = row * chunk.BytesPerRow;
-                        if (srcOffset >= chunk.Data.Length)
-                            break;
-
-                        int copy = Math.Min(rowBytes, chunk.Data.Length - srcOffset);
-                        IntPtr destPtr = IntPtr.Add(locked.Scan0, destY * locked.Stride + destX);
-
-                        if (isRgb)
-                        {
-                            // TWAIN 内存传输的 RGB 是 R,G,B 顺序，GDI+ 的 Format24bppRgb 内存是 B,G,R
-                            copy = copy / 3 * 3;
-                            for (int i = 0; i + 2 < copy; i += 3)
-                            {
-                                swap[i] = chunk.Data[srcOffset + i + 2];
-                                swap[i + 1] = chunk.Data[srcOffset + i + 1];
-                                swap[i + 2] = chunk.Data[srcOffset + i];
-                            }
-                            Marshal.Copy(swap, 0, destPtr, copy);
-                        }
-                        else
-                        {
-                            Marshal.Copy(chunk.Data, srcOffset, destPtr, copy);
-                        }
-                    }
+                    CopyChunkRows(locked, isRgb, isBw, chunk, destX, chunk.YOffset);
                 }
             }
             finally
             {
                 bitmap.UnlockBits(locked);
+            }
+        }
+
+        /// <summary>
+        /// [新增] 将一块原始像素数据拷贝到位图（RGB 会做 R,B 交换）
+        /// </summary>
+        private static void CopyChunkRows(BitmapData locked, bool isRgb, bool isBw,
+            MemoryChunk chunk, int destX, int destY)
+        {
+            int bytesPerPixel = isRgb ? 3 : 1;
+
+            if (isBw && chunk.XOffset % 8 != 0 && !_unalignedWarningShown)
+            {
+                _unalignedWarningShown = true;
+                Console.WriteLine($"\r⚠ 1-bit chunk with unaligned XOffset={chunk.XOffset}, image may be misaligned");
+            }
+
+            int rowBytes = isBw
+                ? Math.Min((chunk.Columns + 7) / 8, chunk.BytesPerRow)
+                : Math.Min(chunk.Columns * bytesPerPixel, chunk.BytesPerRow);
+            rowBytes = Math.Min(rowBytes, locked.Stride - destX);
+            if (rowBytes <= 0)
+                return;
+
+            byte[] swap = isRgb ? new byte[rowBytes] : null;
+
+            for (int row = 0; row < chunk.Rows; row++)
+            {
+                int y = destY + row;
+                if (y < 0 || y >= locked.Height)
+                    break;
+
+                int srcOffset = row * chunk.BytesPerRow;
+                if (srcOffset >= chunk.Data.Length)
+                    break;
+
+                int copy = Math.Min(rowBytes, chunk.Data.Length - srcOffset);
+                IntPtr destPtr = IntPtr.Add(locked.Scan0, y * locked.Stride + destX);
+
+                if (isRgb)
+                {
+                    // TWAIN 内存传输的 RGB 是 R,G,B 顺序，GDI+ 的 Format24bppRgb 内存是 B,G,R
+                    copy = copy / 3 * 3;
+                    for (int i = 0; i + 2 < copy; i += 3)
+                    {
+                        swap[i] = chunk.Data[srcOffset + i + 2];
+                        swap[i + 1] = chunk.Data[srcOffset + i + 1];
+                        swap[i + 2] = chunk.Data[srcOffset + i];
+                    }
+                    Marshal.Copy(swap, 0, destPtr, copy);
+                }
+                else
+                {
+                    Marshal.Copy(chunk.Data, srcOffset, destPtr, copy);
+                }
             }
         }
 
@@ -1009,6 +1368,7 @@ namespace TWAINCLI
                 $"scan_{DateTime.Now:yyyyMMdd_HHmmss}_{_scanCount++}.jpg");
             image.Save(fileName, ImageFormat.Jpeg);
             Console.WriteLine($"Image saved to: {fileName}");
+            UpdatePreview(image, image.Width, image.Height);
         }
 
         private static void SaveBitmapAsJpeg(Bitmap bitmap)
@@ -1060,6 +1420,9 @@ namespace TWAINCLI
         public bool Duplex { get; set; }
         public string CancelFileName { get; set; } = "cancel";  // [新增] 取消触发文件名
         public bool NativeTransfer { get; set; }                // [新增] 强制 Native 传输（关闭进度百分比）
+        public string PreviewPath { get; set; }                 // [新增] 实时预览 JPEG 路径
+        public int PreviewIntervalMs { get; set; } = 500;       // [新增] 预览刷新间隔（毫秒）
+        public int PreviewMaxWidth { get; set; } = 800;         // [新增] 预览最大宽度（0 = 原始尺寸）
     }
 
     /// <summary>
