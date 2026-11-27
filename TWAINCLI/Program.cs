@@ -10,6 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 namespace TWAINCLI
@@ -22,6 +23,12 @@ namespace TWAINCLI
         private static int _scanCount = 0;
         private static volatile bool _cancelRequested = false;  // [新增] 取消标志（volatile保证线程可见性）
         private static FileSystemWatcher _cancelWatcher = null; // [新增] 文件监控器
+
+        // [新增] ShowUI 模式：隐藏父窗口 + 强制激活扫描仪 UI
+        private static Form _parentWindow = null;               // 传给驱动的宿主窗口句柄
+        private static Timer _uiActivationTimer = null;         // 轮询并激活扫描仪 UI 的定时器
+        private static int _uiActivationTicks = 0;              // 已轮询次数
+        private static readonly HashSet<IntPtr> _knownWindows = new HashSet<IntPtr>(); // Enable 前已存在的窗口
 
         // [新增] 内存传输进度状态
         private static long _estimatedTotalPixels = 0;          // 驱动不提供尺寸时，用扫描区域估算
@@ -74,6 +81,26 @@ namespace TWAINCLI
                 return;
             }
 
+            // [新增] NTwain 的 WindowsFormsMessageLoopHook 要求消息循环已经在 UI 线程运行。
+            // 先启动 WinForms 消息循环，再在循环内打开 TWAIN 会话、显示驱动 UI，
+            // 这样驱动 UI 由正常的 WinForms 消息泵处理（而不是 NTwain 内部的 WPF 消息线程）。
+            EnsureParentWindow();
+            _parentWindow.BeginInvoke(new Action(() => BeginScan(config)));
+            try
+            {
+                Application.Run();
+            }
+            finally
+            {
+                CleanupSession();
+            }
+        }
+
+        /// <summary>
+        /// [新增] 在消息循环内打开 TWAIN 会话并启动扫描
+        /// </summary>
+        private static void BeginScan(ScanConfig config)
+        {
             try
             {
                 // Create application identity
@@ -88,10 +115,13 @@ namespace TWAINCLI
                 _session.SourceDisabled += TwainSession_SourceDisabled;
 
                 // Open session
-                var openResult = _session.Open();
+                // [新增] 使用 WinForms 消息钩子，并把宿主窗口句柄同时作为 DSM 窗口，
+                // 与 NAPS2 的做法一致：所有 TWAIN 调用都在 WinForms 消息泵线程上执行。
+                var openResult = _session.Open(new WindowsFormsMessageLoopHook(_parentWindow.Handle));
                 if (openResult != ReturnCode.Success)
                 {
                     Console.WriteLine($"Failed to open TWAIN session: {openResult}");
+                    Application.Exit();
                     return;
                 }
 
@@ -104,7 +134,7 @@ namespace TWAINCLI
                 if (sources.Count == 0)
                 {
                     Console.WriteLine("No scanners found");
-                    _session.Close();
+                    Application.Exit();
                     return;
                 }
 
@@ -116,7 +146,7 @@ namespace TWAINCLI
                     if (selectedSource == null)
                     {
                         Console.WriteLine($"No scanner found with name containing '{config.ScannerName}'");
-                        _session.Close();
+                        Application.Exit();
                         return;
                     }
                 }
@@ -138,13 +168,21 @@ namespace TWAINCLI
                         if (config.ShowUI)
                         {
                             Console.WriteLine("Scanner opened, showing native UI...");
-                            var enableResult = selectedSource.Enable(SourceEnableMode.ShowUI, false, IntPtr.Zero);
+
+                            // [新增] 记录 Enable 前已存在的可见窗口，用于找出驱动刚创建的 UI
+                            SnapshotTopLevelWindows();
+
+                            var enableResult = selectedSource.Enable(SourceEnableMode.ShowUI, false, _parentWindow.Handle);
                             if (enableResult != ReturnCode.Success)
                             {
                                 Console.WriteLine($"Failed to enable scanner: {enableResult}");
                                 selectedSource.Close();
+                                Application.Exit();
                                 return;
                             }
+
+                            // [新增] 部分驱动的 UI 显示后不会自行激活，先把焦点切入一次
+                            StartScannerUIActivation(selectedSource.Name);
                         }
                         else
                         {
@@ -154,11 +192,12 @@ namespace TWAINCLI
                             ConfigureSource(selectedSource, config);
 
                             // Enable data source for scanning (no UI mode)
-                            var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
+                            var enableResult = selectedSource.Enable(SourceEnableMode.NoUI, false, _parentWindow.Handle);
                             if (enableResult != ReturnCode.Success)
                             {
                                 Console.WriteLine($"Failed to enable scanner: {enableResult}");
                                 selectedSource.Close();
+                                Application.Exit();
                                 return;
                             }
                         }
@@ -166,35 +205,60 @@ namespace TWAINCLI
                         // [新增] 启动取消文件监控
                         StartCancelMonitoring(config.CancelFileName);
 
-                        // Run message loop, wait for scan completion
-                        Application.Run();
+                        // [新增] 已经在消息循环内，不能再调用 Application.Run()；
+                        // 扫描完成/取消时由事件处理里的 Application.Exit() 结束循环。
                     }
                     else
                     {
                         Console.WriteLine($"Failed to open scanner: {openDsResult}");
                         selectedSource.Close();
+                        Application.Exit();
                     }
                 }
                 else
                 {
                     Console.WriteLine("No suitable scanner found");
+                    Application.Exit();
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error occurred: {ex.Message}");
                 Console.WriteLine(ex.StackTrace);
+                Application.Exit();
             }
-            finally
-            {
-                // [新增] 停止取消文件监控
-                StopCancelMonitoring();
+        }
 
-                if (_session != null)
+        /// <summary>
+        /// [新增] 消息循环结束后清理 TWAIN 会话和宿主窗口
+        /// </summary>
+        private static void CleanupSession()
+        {
+            // [新增] 停止取消文件监控
+            StopCancelMonitoring();
+
+            // [新增] 停止扫描仪 UI 激活轮询
+            StopScannerUIActivation();
+
+            if (_session != null)
+            {
+                try
                 {
-                    _session.Close();
-                    Console.WriteLine("TWAIN session closed");
+                    if (_session.IsDsmOpen)
+                        _session.Close();
                 }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error closing TWAIN session: {ex.Message}");
+                }
+                Console.WriteLine("TWAIN session closed");
+            }
+
+            // [新增] 释放 ShowUI 宿主窗口
+            if (_parentWindow != null)
+            {
+                try { _parentWindow.Dispose(); } catch { /* 忽略释放异常 */ }
+                _parentWindow = null;
             }
         }
 
@@ -272,6 +336,260 @@ namespace TWAINCLI
             }
             catch { /* 忽略删除异常 */ }
         }
+
+        /// <summary>
+        /// [新增] 创建一个不可见的父窗口，作为驱动 UI 的宿主窗口。
+        /// 部分驱动（如 Canon）在 hParent 为 IntPtr.Zero 时不会把 UI 激活到前台。
+        /// </summary>
+        private static void EnsureParentWindow()
+        {
+            if (_parentWindow != null && !_parentWindow.IsDisposed)
+                return;
+
+            var area = Screen.PrimaryScreen != null
+                ? Screen.PrimaryScreen.WorkingArea
+                : new Rectangle(0, 0, 1, 1);
+            _parentWindow = new Form
+            {
+                ShowInTaskbar = false,
+                FormBorderStyle = FormBorderStyle.None,
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(area.Left + area.Width / 2, area.Top + area.Height / 2),
+                Size = new Size(1, 1),
+                Text = "TWAINCLI"
+            };
+
+            // 访问 Handle 强制创建窗口句柄；不调用 Show()，窗口保持不可见
+            IntPtr handle = _parentWindow.Handle;
+            GC.KeepAlive(handle);
+        }
+
+        /// <summary>
+        /// [新增] 记录当前所有可见的顶层窗口（用于识别驱动随后创建的扫描仪 UI）
+        /// </summary>
+        private static void SnapshotTopLevelWindows()
+        {
+            _knownWindows.Clear();
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (IsWindowVisible(hWnd))
+                    _knownWindows.Add(hWnd);
+                return true;
+            }, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// [新增] 轮询等待扫描仪 UI 出现，并把它切换为前台窗口。
+        /// 相当于手动“切换一次焦点”，让 Canon 等驱动初始化界面。
+        /// </summary>
+        private static void StartScannerUIActivation(string sourceName)
+        {
+            StopScannerUIActivation();
+
+            _uiActivationTicks = 0;
+            _uiActivationTimer = new Timer { Interval = 300 };
+            _uiActivationTimer.Tick += (sender, e) =>
+            {
+                _uiActivationTicks++;
+
+                IntPtr scannerWindow = FindScannerWindow(sourceName);
+                if (scannerWindow != IntPtr.Zero && TryActivateWindow(scannerWindow))
+                {
+                    Console.WriteLine($"Scanner UI activated (hwnd=0x{scannerWindow.ToInt64():X})");
+                    StopScannerUIActivation();
+                    return;
+                }
+
+                // 最多等待 15 秒，避免一直抢占焦点或空转
+                if (_uiActivationTicks >= 50)
+                    StopScannerUIActivation();
+            };
+            _uiActivationTimer.Start();
+        }
+
+        private static void StopScannerUIActivation()
+        {
+            if (_uiActivationTimer != null)
+            {
+                _uiActivationTimer.Stop();
+                _uiActivationTimer.Dispose();
+                _uiActivationTimer = null;
+            }
+        }
+
+        /// <summary>
+        /// [新增] 在 Enable 之后新出现（或刚变为可见）的顶层窗口中查找扫描仪 UI
+        /// </summary>
+        private static IntPtr FindScannerWindow(string sourceName)
+        {
+            IntPtr result = IntPtr.Zero;
+            uint currentPid = GetCurrentProcessId();
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                // 只关注 Enable 之后新出现的可见窗口
+                if (_knownWindows.Contains(hWnd) || !IsWindowVisible(hWnd))
+                    return true;
+
+                uint windowPid;
+                GetWindowThreadProcessId(hWnd, out windowPid);
+
+                var titleBuilder = new StringBuilder(512);
+                GetWindowText(hWnd, titleBuilder, titleBuilder.Capacity);
+                string title = titleBuilder.ToString();
+
+                var classBuilder = new StringBuilder(256);
+                GetClassName(hWnd, classBuilder, classBuilder.Capacity);
+                string className = classBuilder.ToString();
+
+                // 经典 TWAIN DS 跑在应用进程内，因此同进程的新窗口优先；
+                // 也兼容独立进程承载 UI 的驱动（按标题/类名识别）
+                bool sameProcess = windowPid == currentPid;
+                bool looksLikeTwain = className.IndexOf("TWNDS", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool titleMatches = title.Length > 0 && (
+                    (!string.IsNullOrEmpty(sourceName) && title.IndexOf(sourceName, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                    title.IndexOf("ScanGear", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    title.IndexOf("Canon", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    title.IndexOf("scan", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                if (!sameProcess && !looksLikeTwain && !titleMatches)
+                    return true;
+
+                // 跳过提示框、隐藏的辅助窗口等小窗口
+                RECT rect;
+                if (!GetWindowRect(hWnd, out rect))
+                    return true;
+                if (rect.Right - rect.Left < 150 || rect.Bottom - rect.Top < 100)
+                    return true;
+
+                result = hWnd;
+                return false; // 找到第一个候选窗口即停止枚举
+            }, IntPtr.Zero);
+
+            return result;
+        }
+
+        /// <summary>
+        /// [新增] 把窗口切换为前台窗口（等价于用户手动切换一次焦点）
+        /// </summary>
+        private static bool TryActivateWindow(IntPtr hWnd)
+        {
+            if (GetForegroundWindow() == hWnd)
+                return true;
+
+            // 先直接尝试
+            ShowWindow(hWnd, SW_RESTORE);
+            BringWindowToTop(hWnd);
+            SetForegroundWindow(hWnd);
+
+            if (GetForegroundWindow() == hWnd)
+                return true;
+
+            // 系统通常只允许前台进程调用 SetForegroundWindow。
+            // 临时把输入队列附加到当前前台线程，可绕过该限制（经典做法）。
+            uint currentThreadId = GetCurrentThreadId();
+            IntPtr foregroundWindow = GetForegroundWindow();
+            uint foregroundPid;
+            uint foregroundThreadId = GetWindowThreadProcessId(foregroundWindow, out foregroundPid);
+            uint targetPid;
+            uint targetThreadId = GetWindowThreadProcessId(hWnd, out targetPid);
+
+            bool attachedToForeground = false;
+            bool attachedToTarget = false;
+            try
+            {
+                // 前台窗口无响应时不要 attach，否则可能把本进程一起卡死
+                if (foregroundThreadId != 0 && foregroundThreadId != currentThreadId &&
+                    !IsHungAppWindow(foregroundWindow))
+                {
+                    attachedToForeground = AttachThreadInput(foregroundThreadId, currentThreadId, true);
+                }
+
+                if (targetThreadId != 0 && targetThreadId != currentThreadId &&
+                    targetThreadId != foregroundThreadId)
+                {
+                    attachedToTarget = AttachThreadInput(targetThreadId, currentThreadId, true);
+                }
+
+                BringWindowToTop(hWnd);
+                ShowWindow(hWnd, SW_SHOW);
+                SetForegroundWindow(hWnd);
+                SetActiveWindow(hWnd);
+                SetFocus(hWnd);
+            }
+            finally
+            {
+                if (attachedToTarget)
+                    AttachThreadInput(targetThreadId, currentThreadId, false);
+                if (attachedToForeground)
+                    AttachThreadInput(foregroundThreadId, currentThreadId, false);
+            }
+
+            return GetForegroundWindow() == hWnd;
+        }
+
+        // ===== Win32 interop：扫描仪 UI 激活 =====
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsHungAppWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetActiveWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentProcessId();
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        private const int SW_RESTORE = 9;
+        private const int SW_SHOW = 5;
 
         /// <summary>
         /// Configure scanner TWAIN Capabilities
