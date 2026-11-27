@@ -700,8 +700,9 @@ namespace TWAINCLI
         }
 
         /// <summary>
-        /// [新增] 选择传输方式：只有 Memory 传输能按已传像素计算进度
-        /// TWAIN 规范只强制要求 Native 传输，Memory 是可选能力，所以必须检查并回退
+        /// 选择传输方式：默认 Native（更快、内存占用更低）。
+        /// 只有显式指定 --memory 或 --preview 时才使用 Memory（内存传输才能给出进度百分比/实时预览）。
+        /// TWAIN 规范只强制要求 Native 传输，Memory 是可选能力，所以必须检查并回退。
         /// </summary>
         private static void ConfigureTransferMode(DataSource source, ScanConfig config)
         {
@@ -712,9 +713,13 @@ namespace TWAINCLI
                                         (long)Math.Ceiling(config.PageHeight * config.Resolution);
             }
 
-            if (config.NativeTransfer)
+            // 默认 Native；--memory 或 --preview 才启用 Memory（显式 --native 会覆盖 --preview）
+            bool useMemory = config.MemoryTransfer ||
+                             (!config.NativeTransfer && !string.IsNullOrEmpty(config.PreviewPath));
+
+            if (!useMemory)
             {
-                Console.WriteLine("Transfer mode: Native (requested), no progress percentage");
+                Console.WriteLine("Transfer mode: Native (default), no progress percentage");
                 WarnPreviewRequiresMemory(config);
                 return;
             }
@@ -887,8 +892,12 @@ namespace TWAINCLI
                             config.CancelFileName = args[++i];
                         break;
 
-                    case "--native":  // [新增] 强制 Native 传输（不做内存拼图，不输出百分比）
+                    case "--native":  // [新增] 强制 Native 传输（默认即为 Native）
                         config.NativeTransfer = true;
+                        break;
+
+                    case "--memory":  // [新增] 使用 Memory 传输（支持进度百分比和实时预览）
+                        config.MemoryTransfer = true;
                         break;
 
                     case "--preview":  // [新增] 实时预览输出路径
@@ -941,8 +950,9 @@ namespace TWAINCLI
             Console.WriteLine("  -y <height>           Scan area height (inches)");
             Console.WriteLine("  --duplex              Enable duplex scanning");
             Console.WriteLine("  --showUI              Show native scanner UI");
-            Console.WriteLine("  --native              Force native transfer (no progress percentage)");
-            Console.WriteLine("  --preview <path>      Live preview JPEG updated while scanning (memory transfer only)");
+            Console.WriteLine("  --native              Use native transfer (default; no progress percentage)");
+            Console.WriteLine("  --memory              Use memory transfer (enables progress percentage and live preview)");
+            Console.WriteLine("  --preview <path>      Live preview JPEG updated while scanning (implies memory transfer)");
             Console.WriteLine("  --previewInterval <ms> Preview refresh interval (default: 500)");
             Console.WriteLine("  --previewWidth <px>   Max preview width (default: 800, 0 = full size)");
             Console.WriteLine("  --cancelFile <name>   Custom cancel trigger filename (default: cancel)");
@@ -1737,7 +1747,8 @@ namespace TWAINCLI
         public bool HasArea { get; set; }
         public bool Duplex { get; set; }
         public string CancelFileName { get; set; } = "cancel";  // [新增] 取消触发文件名
-        public bool NativeTransfer { get; set; }                // [新增] 强制 Native 传输（关闭进度百分比）
+        public bool NativeTransfer { get; set; }                // [新增] 强制 Native 传输（默认即为 Native）
+        public bool MemoryTransfer { get; set; }                // [新增] 使用 Memory 传输（进度百分比 / 实时预览）
         public string PreviewPath { get; set; }                 // [新增] 实时预览 JPEG 路径
         public int PreviewIntervalMs { get; set; } = 500;       // [新增] 预览刷新间隔（毫秒）
         public int PreviewMaxWidth { get; set; } = 800;         // [新增] 预览最大宽度（0 = 原始尺寸）
